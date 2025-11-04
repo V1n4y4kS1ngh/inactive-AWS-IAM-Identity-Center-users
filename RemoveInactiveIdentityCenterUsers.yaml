@@ -1,0 +1,422 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to automatically remove inactive IAM Identity Center users (90 days) with Slack notifications'
+Author: Vinayak Singh <vinayakclear@gmail.com>
+Parameters:
+  InactiveDaysThreshold:
+    Type: Number
+    Default: 90
+    Description: Number of days of inactivity before a user is considered inactive
+    MinValue: 1
+    MaxValue: 365
+  
+  SlackWebhookURL:
+    Type: String
+    Description: Slack webhook URL for notifications (optional, leave empty to disable)
+    Default: ''
+    NoEcho: true
+  
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(0 0 1 * ? *)'
+    Description: EventBridge schedule expression (default: monthly on 1st day at midnight UTC)
+    AllowedPattern: '^cron\\(.*\\)$|^rate\\(.*\\)$'
+  
+  EnableNotifications:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable Slack notifications (requires SlackWebhookURL)
+
+Resources:
+  # IAM Role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'RemoveInactiveIdentityCenterUsers-Role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RemoveInactiveUsersPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                  - organizations:ListAccounts
+                  - sso-admin:ListAccountAssignments
+                  - sso-admin:ListPermissionSets
+                  - sso-admin:ListInstances
+                  - sso-admin:DeleteAccountAssignment
+                  - identitystore:ListUsers
+                  - identitystore:DeleteUser
+                  - identitystore:DescribeUser
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunction}:*'
+
+  # CloudWatch Log Group
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunction}'
+      RetentionInDays: 90
+
+  # Lambda Function
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub 'RemoveInactiveIdentityCenterUsers-${AWS::Region}'
+      Description: 'Automatically removes inactive IAM Identity Center users who haven''t signed in for the specified threshold'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          INACTIVE_DAYS_THRESHOLD: !Ref InactiveDaysThreshold
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookURL
+          ENABLE_NOTIFICATIONS: !Ref EnableNotifications
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+          import urllib.request
+          import urllib.parse
+
+          # Initialize AWS clients
+          sso_admin_client = boto3.client('sso-admin')
+          identitystore_client = boto3.client('identitystore')
+          cloudtrail_client = boto3.client('cloudtrail')
+          org_client = boto3.client('organizations')
+
+          def send_slack_notification(color, title, message, webhook_url):
+              """Send notification to Slack."""
+              if not webhook_url or not os.environ.get('ENABLE_NOTIFICATIONS') == 'true':
+                  return
+              
+              payload = {
+                  "attachments": [
+                      {
+                          "color": color,
+                          "title": title,
+                          "text": message,
+                          "footer": "AWS IAM Identity Center - Inactive User Removal",
+                          "ts": int(datetime.utcnow().timestamp())
+                      }
+                  ]
+              }
+              
+              try:
+                  data = json.dumps(payload).encode('utf-8')
+                  req = urllib.request.Request(
+                      webhook_url,
+                      data=data,
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  urllib.request.urlopen(req, timeout=10)
+              except Exception as e:
+                  print(f"Error sending Slack notification: {e}")
+
+          def get_identity_center_info():
+              """Fetch the Identity Center directory ID and Instance ARN."""
+              response = sso_admin_client.list_instances()
+              if not response['Instances']:
+                  raise Exception("No Identity Center instance found.")
+              instance = response['Instances'][0]
+              return instance['InstanceArn'], instance['IdentityStoreId']
+
+          def list_users(identity_store_id):
+              """List all users in AWS Identity Center."""
+              users = []
+              paginator = identitystore_client.get_paginator('list_users')
+              for page in paginator.paginate(IdentityStoreId=identity_store_id):
+                  users.extend(page['Users'])
+              return users
+
+          def check_user_authentication(username, threshold_date):
+              """
+              Check if a user has UserAuthentication logged in CloudTrail in the threshold period.
+              Returns True if the user has authenticated, otherwise False.
+              """
+              if not username:
+                  print("Warning: Username is empty. Skipping authentication check.")
+                  return False
+
+              try:
+                  paginator = cloudtrail_client.get_paginator('lookup_events')
+                  for page in paginator.paginate(
+                      LookupAttributes=[
+                          {'AttributeKey': 'EventName', 'AttributeValue': 'UserAuthentication'}
+                      ],
+                      StartTime=threshold_date,
+                      EndTime=datetime.utcnow()
+                  ):
+                      for event in page['Events']:
+                          # Parse the CloudTrail event
+                          event_detail = json.loads(event['CloudTrailEvent'])
+                          username_in_event = event_detail.get('additionalEventData', {}).get('UserName')
+
+                          # Match the username to confirm the event belongs to the user
+                          if username_in_event == username:
+                              return True
+              except Exception as e:
+                  print(f"Error checking authentication for user '{username}': {e}")
+              return False
+
+          def find_user_account_assignments(instance_arn, principal_id):
+              """Find all account assignments for a specific user."""
+              user_assignments = []
+              
+              # Get all accounts
+              accounts = []
+              try:
+                  paginator = org_client.get_paginator('list_accounts')
+                  for page in paginator.paginate():
+                      accounts.extend([account['Id'] for account in page['Accounts']])
+              except ClientError as e:
+                  print(f"Error listing accounts: {e}")
+                  return user_assignments
+              
+              # Get all permission sets
+              permission_sets = []
+              try:
+                  paginator = sso_admin_client.get_paginator('list_permission_sets')
+                  for page in paginator.paginate(InstanceArn=instance_arn):
+                      permission_sets.extend(page['PermissionSets'])
+              except ClientError as e:
+                  print(f"Error listing permission sets: {e}")
+                  return user_assignments
+              
+              # Check each account and permission set combination for the user
+              for account_id in accounts:
+                  for permission_set_arn in permission_sets:
+                      try:
+                          paginator = sso_admin_client.get_paginator('list_account_assignments')
+                          for page in paginator.paginate(
+                              InstanceArn=instance_arn,
+                              AccountId=account_id,
+                              PermissionSetArn=permission_set_arn
+                          ):
+                              # Filter assignments for the specific user
+                              for assignment in page['AccountAssignments']:
+                                  if assignment['PrincipalId'] == principal_id and assignment['PrincipalType'] == 'USER':
+                                      user_assignments.append({
+                                          'AccountId': account_id,
+                                          'PermissionSetArn': permission_set_arn,
+                                          'PrincipalId': principal_id
+                                      })
+                      except ClientError as e:
+                          print(f"Error listing assignments for account {account_id}, permission set {permission_set_arn}: {e}")
+                          continue
+              
+              return user_assignments
+
+          def remove_user_assignments(instance_arn, assignments):
+              """Remove account assignments for a specific user."""
+              success = True
+              for assignment in assignments:
+                  try:
+                      print(f"Removing assignment: Account={assignment['AccountId']}, PermissionSet={assignment['PermissionSetArn']}")
+                      sso_admin_client.delete_account_assignment(
+                          InstanceArn=instance_arn,
+                          TargetId=assignment['AccountId'],
+                          TargetType='AWS_ACCOUNT',
+                          PermissionSetArn=assignment['PermissionSetArn'],
+                          PrincipalType='USER',
+                          PrincipalId=assignment['PrincipalId']
+                      )
+                  except ClientError as e:
+                      print(f"Error removing assignment: {e}")
+                      success = False
+              
+              return success
+
+          def delete_user(identity_store_id, user_id, username):
+              """Delete a user from AWS Identity Center."""
+              try:
+                  identitystore_client.delete_user(
+                      IdentityStoreId=identity_store_id,
+                      UserId=user_id
+                  )
+                  print(f"Deleted user: {username} (ID: {user_id})")
+                  return True
+              except ClientError as e:
+                  print(f"Error deleting user {username} (ID: {user_id}): {e}")
+                  return False
+
+          def lambda_handler(event, context):
+              """AWS Lambda entry point."""
+              try:
+                  # Get configuration
+                  threshold_days = int(os.environ.get('INACTIVE_DAYS_THRESHOLD', '90'))
+                  slack_webhook = os.environ.get('SLACK_WEBHOOK_URL', '')
+                  threshold_date = datetime.utcnow() - timedelta(days=threshold_days)
+                  
+                  print(f"Starting inactive user removal process. Threshold: {threshold_days} days")
+                  
+                  # Step 1: Get Identity Center directory ID and Instance ARN
+                  instance_arn, identity_store_id = get_identity_center_info()
+                  print(f"Found Identity Center instance: {instance_arn}")
+
+                  # Step 2: List all users
+                  users = list_users(identity_store_id)
+                  print(f"Found {len(users)} users in Identity Center")
+
+                  inactive_users = []
+                  deleted_users = []
+                  failed_deletions = []
+
+                  for user in users:
+                      user_name = user.get('UserName')
+                      user_id = user.get('UserId')
+                      user_email = user.get('Emails', [{}])[0].get('Value', 'N/A') if user.get('Emails') else 'N/A'
+
+                      # Step 3: Check if the user has authenticated recently
+                      if check_user_authentication(user_name, threshold_date):
+                          print(f"User '{user_name}' (ID: {user_id}) has authenticated recently. Skipping.")
+                          continue
+
+                      inactive_users.append(user_name)
+                      print(f"\nProcessing inactive user: '{user_name}' (ID: {user_id}, Email: {user_email})")
+                      
+                      # Step 4: Find all account assignments for this user
+                      user_assignments = find_user_account_assignments(instance_arn, user_id)
+                      
+                      if user_assignments:
+                          print(f"Found {len(user_assignments)} assignments for user '{user_name}'")
+                          
+                          # Step 5: Remove the user's assignments
+                          if remove_user_assignments(instance_arn, user_assignments):
+                              print(f"Successfully removed all assignments for user '{user_name}'")
+                          else:
+                              print(f"Failed to remove some assignments for user '{user_name}'. Skipping deletion.")
+                              failed_deletions.append(user_name)
+                              continue
+                      else:
+                          print(f"No assignments found for user '{user_name}'")
+
+                      # Step 6: Delete the user
+                      if delete_user(identity_store_id, user_id, user_name):
+                          deleted_users.append(user_name)
+                      else:
+                          failed_deletions.append(user_name)
+
+                  # Send Slack notification
+                  summary = f"*Inactive User Removal Summary*\n"
+                  summary += f"• Total users checked: {len(users)}\n"
+                  summary += f"• Inactive users found: {len(inactive_users)}\n"
+                  summary += f"• Successfully deleted: {len(deleted_users)}\n"
+                  summary += f"• Failed deletions: {len(failed_deletions)}\n"
+                  summary += f"• Inactivity threshold: {threshold_days} days\n\n"
+                  
+                  if deleted_users:
+                      summary += f"*Deleted Users:*\n"
+                      for user in deleted_users:
+                          summary += f"• {user}\n"
+                  
+                  if failed_deletions:
+                      summary += f"\n*Failed Deletions:*\n"
+                      for user in failed_deletions:
+                          summary += f"• {user}\n"
+
+                  color = "good" if len(failed_deletions) == 0 else "warning"
+                  if len(deleted_users) == 0 and len(failed_deletions) == 0:
+                      color = "good"
+                      summary = f"No inactive users found. All {len(users)} users have been active within the last {threshold_days} days."
+
+                  send_slack_notification(
+                      color,
+                      "IAM Identity Center - Inactive User Removal",
+                      summary,
+                      slack_webhook
+                  )
+
+                  print(f"\nSummary: Found {len(inactive_users)} inactive users, successfully deleted {len(deleted_users)} users, {len(failed_deletions)} failed")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Inactive user removal completed',
+                          'totalUsers': len(users),
+                          'inactiveUsers': len(inactive_users),
+                          'deletedUsers': len(deleted_users),
+                          'failedDeletions': len(failed_deletions)
+                      })
+                  }
+
+              except Exception as e:
+                  error_msg = f"Error in main execution: {e}"
+                  print(error_msg)
+                  send_slack_notification(
+                      "danger",
+                      "IAM Identity Center - Inactive User Removal Failed",
+                      f"An error occurred during inactive user removal:\n```{error_msg}```",
+                      os.environ.get('SLACK_WEBHOOK_URL', '')
+                  )
+                  raise e
+
+  # EventBridge Rule for scheduled execution
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'RemoveInactiveIdentityCenterUsers-Schedule-${AWS::Region}'
+      Description: 'Monthly schedule to remove inactive IAM Identity Center users'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: 'RemoveInactiveUsersTarget'
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref LambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+  
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt LambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+  
+  EventBridgeRuleName:
+    Description: Name of the EventBridge scheduled rule
+    Value: !Ref EventBridgeRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleName'
+  
+  ExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
+
